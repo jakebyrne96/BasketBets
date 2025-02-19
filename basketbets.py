@@ -1,28 +1,29 @@
 import math
-from nba_api.stats.static import teams
-from nba_api.stats.endpoints import teamgamelog
 import time
+from nba_api.stats.static import teams
+from nba_api.stats.endpoints import teamgamelog, boxscoretraditionalv2
 
 def fetch_team_id(team_name):
     """
-    Look up the team ID using nba_api.
-    This function searches through all NBA teams and returns the first match.
+    Looks up the team using nba_api.
+    Returns a tuple (team_id, full_team_name) for the first matching team.
     """
     all_teams = teams.get_teams()
     team_name_lower = team_name.lower()
     for team in all_teams:
-        # We check if the team name (or abbreviation) matches what you entered.
+        # We check if your input is found in the full name or matches the abbreviation.
         if team_name_lower in team["full_name"].lower() or team_name_lower == team["abbreviation"].lower():
             return team["id"], team["full_name"]
     raise ValueError(f"Team '{team_name}' not found. Please double-check the name and try again.")
 
 def fetch_recent_games(team_id, num_games=5):
     """
-    Retrieves the most recent games for the given team.
-    nba_api returns the games sorted in descending order, so we just pick the top few.
-    A short sleep is included to be kind to the API (it can be a bit rate-limited).
+    Uses nba_api's TeamGameLog to get recent games for a team.
+    Returns a tuple (games, headers) where games is a list of game log rows
+    and headers is a list of column names.
+    A short sleep is added to help with rate limiting.
     """
-    time.sleep(0.6)
+    time.sleep(0.6)  # be nice to the API
     gamelog = teamgamelog.TeamGameLog(team_id=team_id)
     data = gamelog.get_dict()["resultSets"][0]
     games = data["rowSet"]
@@ -31,25 +32,47 @@ def fetch_recent_games(team_id, num_games=5):
         raise ValueError(f"Not enough recent games available for team id {team_id}.")
     return games[:num_games], headers
 
-def compute_team_stats(games, headers):
+def get_opponent_points(game_id, team_id):
     """
-    Computes average points scored, points allowed, and the point differential.
-    The team game log provides:
-      - 'PTS': Points scored by the team.
-      - 'PLUS_MINUS': Difference between team points and opponent points.
-    We calculate opponent points with:
-        Opponent Points = Team Points - PLUS_MINUS
+    Retrieves the opponent's points for a given game.
+    It calls the box score endpoint and looks through the team stats.
+    """
+    time.sleep(0.6)  # avoid rate limits
+    boxscore = boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id)
+    result_set = boxscore.get_dict()["resultSets"][1]  # team stats are usually here
+    headers = result_set["headers"]
+    rows = result_set["rowSet"]
+    team_id_index = headers.index("TEAM_ID")
+    pts_index = headers.index("PTS")
+    # Look through the rows and return the points for the team that is NOT ours.
+    for row in rows:
+        if row[team_id_index] != team_id:
+            return row[pts_index]
+    raise ValueError(f"Opponent points not found for game {game_id}.")
+
+def compute_team_stats(team_id, games, headers):
+    """
+    Computes average points scored, allowed, and differential for a team.
+    Instead of relying on the PLUS_MINUS field, we use the team's points from the game log
+    and fetch the opponent's points using the box score endpoint.
     """
     pts_index = headers.index("PTS")
-    plus_minus_index = headers.index("PLUS_MINUS")
+    # Try to find the game id field with a fallback in case the header name is different.
+    try:
+        game_id_index = headers.index("GAME_ID")
+    except ValueError:
+        try:
+            game_id_index = headers.index("Game_ID")
+        except ValueError:
+            raise ValueError(f"'GAME_ID' field not found in headers: {headers}")
     
     total_scored = 0
     total_allowed = 0
     for game in games:
-        pts = game[pts_index]
-        plus_minus = game[plus_minus_index]
-        opponent_pts = pts - plus_minus
-        total_scored += pts
+        team_pts = game[pts_index]
+        game_id = game[game_id_index]
+        opponent_pts = get_opponent_points(game_id, team_id)
+        total_scored += team_pts
         total_allowed += opponent_pts
 
     avg_scored = total_scored / len(games)
@@ -59,9 +82,8 @@ def compute_team_stats(games, headers):
 
 def prob_to_moneyline(prob):
     """
-    Converts win probability into moneyline odds.
-    If the probability is 50% or higher, we return negative odds (favoring the team).
-    Otherwise, we return positive odds.
+    Converts win probability to moneyline odds.
+    Probabilities ≥ 50% yield negative odds (favorites), while below 50% yield positive odds.
     """
     if prob >= 0.5:
         return -round((prob / (1 - prob)) * 100)
@@ -85,16 +107,16 @@ def main():
         games1, headers1 = fetch_recent_games(team1_id)
         games2, headers2 = fetch_recent_games(team2_id)
     except Exception as e:
-        print("There was a problem fetching the recent games:", e)
+        print("There was a problem fetching recent games:", e)
         return
 
-    team1_stats = compute_team_stats(games1, headers1)
-    team2_stats = compute_team_stats(games2, headers2)
+    team1_stats = compute_team_stats(team1_id, games1, headers1)
+    team2_stats = compute_team_stats(team2_id, games2, headers2)
 
     print(f"\n{team1_full} - Avg Points Scored: {team1_stats[0]:.2f}, Allowed: {team1_stats[1]:.2f}, Differential: {team1_stats[2]:.2f}")
     print(f"{team2_full} - Avg Points Scored: {team2_stats[0]:.2f}, Allowed: {team2_stats[1]:.2f}, Differential: {team2_stats[2]:.2f}")
 
-    # We calculate the expected margin as half the difference between the two differentials.
+    # Calculate expected margin as half the difference of the teams' differentials.
     expected_margin = (team1_stats[2] - team2_stats[2]) / 2
     print(f"\nExpected Margin (a positive value means {team1_full} is favored): {expected_margin:.2f} points")
 
@@ -106,8 +128,8 @@ def main():
         handicap_line = "Even match"
     print(f"\nHandicap (Point Spread): {handicap_line}")
 
-    # A logistic function estimates win probabilities based on the expected margin.
-    scale = 5.0  # You can tweak this factor if needed.
+    # Estimate win probabilities using a logistic function.
+    scale = 5.0  # You can tweak this parameter if needed.
     win_prob_team1 = 1 / (1 + math.exp(-expected_margin / scale))
     win_prob_team2 = 1 - win_prob_team1
 
